@@ -1,50 +1,39 @@
-import { chromium } from 'playwright';
-import { mkdir, writeFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import {
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile
+} from 'node:fs/promises';
 import path from 'node:path';
+import { chromium } from 'playwright';
 
-const BASE = 'https://styles.refero.design';
-const OUT = path.resolve('output');
-const LIMIT = Number(process.env.LIMIT || '1');
+const CATALOG_FILE = path.resolve(process.env.CATALOG_FILE || 'catalog/catalog.json');
+const OUTPUT_DIR = path.resolve(process.env.OUTPUT_DIR || 'output');
+const SHARD_INDEX = Number(process.env.SHARD_INDEX || '0');
+const SHARD_TOTAL = Number(process.env.SHARD_TOTAL || '1');
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || '4');
+const BETWEEN_STYLES_MS = Number(process.env.BETWEEN_STYLES_MS || '125');
+
+const EXPORTS = [
+  { tab: 'DESIGN.md', extension: '.md', file: 'design.md', kind: 'design' },
+  { tab: 'Tailwind v4', extension: '.css', file: 'tailwind-v4.css', kind: 'tailwind' },
+  { tab: 'CSS Variables', extension: '.css', file: 'css-variables.css', kind: 'variables' },
+  { tab: 'Design Tokens', extension: '.json', file: 'design-tokens.json', kind: 'tokens' }
+];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const partLabel = String(SHARD_INDEX).padStart(2, '0');
 
-async function fetchJson(url, attempts = 5) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          accept: 'application/json',
-          'user-agent': 'refero-exporter/1.0 (+github-actions)'
-        },
-        signal: AbortSignal.timeout(45_000)
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-      }
-      return await response.json();
-    } catch (error) {
-      lastError = error;
-      if (attempt < attempts) await sleep(500 * attempt);
-    }
+function assertShardSettings() {
+  if (!Number.isInteger(SHARD_INDEX) || !Number.isInteger(SHARD_TOTAL)) {
+    throw new Error('SHARD_INDEX and SHARD_TOTAL must be integers');
   }
-  throw lastError;
-}
-
-async function getCatalog() {
-  const result = await fetchJson(`${BASE}/api/styles?page=1`);
-  if (!Array.isArray(result.styles) || result.styles.length === 0) {
-    throw new Error(`Unexpected catalog response: ${JSON.stringify(result).slice(0, 1000)}`);
+  if (SHARD_TOTAL < 1 || SHARD_INDEX < 0 || SHARD_INDEX >= SHARD_TOTAL) {
+    throw new Error(`Invalid shard settings: index=${SHARD_INDEX}, total=${SHARD_TOTAL}`);
   }
-  return result.styles;
-}
-
-function folderNameFor(style) {
-  let host = 'unknown-site';
-  try {
-    host = new URL(style.url).hostname || host;
-  } catch {}
-  return host.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '') || `style-${style.id}`;
 }
 
 async function lastVisible(locator) {
@@ -55,169 +44,294 @@ async function lastVisible(locator) {
   return null;
 }
 
-async function clickNamedButton(page, name) {
+async function waitForVisible(locator, timeoutMs = 30_000, description = 'element') {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const target = await lastVisible(locator);
+    if (target) return target;
+    await sleep(200);
+  }
+  throw new Error(`Timed out waiting for visible ${description}`);
+}
+
+async function namedButton(page, name, timeoutMs = 30_000) {
   const exact = page.getByRole('button', { name, exact: true });
-  let target = await lastVisible(exact);
-  if (!target) {
-    const regex = new RegExp(`^\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
-    target = await lastVisible(page.locator('button').filter({ hasText: regex }));
+  try {
+    return await waitForVisible(exact, timeoutMs, `button “${name}”`);
+  } catch {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const fallback = page.locator('button').filter({ hasText: new RegExp(`^\\s*${escaped}\\s*$`, 'i') });
+    return await waitForVisible(fallback, 8_000, `fallback button “${name}”`);
   }
-  if (!target) throw new Error(`Visible button not found: ${name}`);
-  await target.scrollIntoViewIfNeeded();
-  await target.click({ timeout: 15_000 });
 }
 
-async function visibleButtonDiagnostics(page) {
-  const buttons = page.locator('button');
-  const rows = [];
-  for (let i = 0; i < await buttons.count(); i += 1) {
-    const button = buttons.nth(i);
-    if (!(await button.isVisible().catch(() => false))) continue;
-    rows.push({
-      index: i,
-      text: (await button.innerText().catch(() => '')).trim(),
-      aria: await button.getAttribute('aria-label'),
-      title: await button.getAttribute('title')
-    });
-  }
-  return rows;
+async function clickNamedButton(page, name) {
+  const button = await namedButton(page, name);
+  await button.scrollIntoViewIfNeeded();
+  await button.click({ timeout: 20_000 });
 }
 
-async function findDownloadButton(page, extension) {
-  const buttons = page.locator('button');
-  const candidates = [];
-  for (let i = 0; i < await buttons.count(); i += 1) {
-    const button = buttons.nth(i);
-    if (!(await button.isVisible().catch(() => false))) continue;
-    const text = (await button.innerText().catch(() => '')).trim();
-    const aria = (await button.getAttribute('aria-label')) || '';
-    const title = (await button.getAttribute('title')) || '';
-    const combined = `${text} ${aria} ${title}`.trim();
-    let score = 0;
-    if (text === extension) score = 100;
-    else if (text.toLowerCase() === `download ${extension}`.toLowerCase()) score = 95;
-    else if (/download/i.test(combined) && combined.includes(extension)) score = 90;
-    else if (text.endsWith(extension)) score = 80;
-    else if (combined.includes(extension)) score = 60;
-    if (score > 0) candidates.push({ button, score, index: i, text, aria, title });
-  }
-  candidates.sort((a, b) => b.score - a.score || b.index - a.index);
-  return candidates[0] || null;
+async function sha256File(filePath) {
+  const data = await readFile(filePath);
+  return createHash('sha256').update(data).digest('hex');
 }
 
-async function largestVisibleCodeBlock(page) {
-  const selectors = ['pre', 'code'];
-  let best = '';
-  for (const selector of selectors) {
-    const blocks = page.locator(selector);
-    for (let i = 0; i < await blocks.count(); i += 1) {
-      const block = blocks.nth(i);
-      if (!(await block.isVisible().catch(() => false))) continue;
-      const text = await block.textContent().catch(() => '');
-      if (text && text.length > best.length) best = text;
+async function validateFile(filePath, kind) {
+  const info = await stat(filePath);
+  if (!info.isFile() || info.size < 20) {
+    throw new Error(`Downloaded ${kind} file is missing or too small: ${filePath}`);
+  }
+
+  const text = await readFile(filePath, 'utf8');
+  if (kind === 'design' && (!text.trimStart().startsWith('#') || !/Style Reference|Tokens|Theme/i.test(text))) {
+    throw new Error(`DESIGN.md validation failed: ${filePath}`);
+  }
+  if (kind === 'tailwind' && !text.includes('@theme')) {
+    throw new Error(`Tailwind v4 validation failed: ${filePath}`);
+  }
+  if (kind === 'variables' && !text.includes(':root')) {
+    throw new Error(`CSS Variables validation failed: ${filePath}`);
+  }
+  if (kind === 'tokens') {
+    try {
+      JSON.parse(text);
+    } catch (error) {
+      throw new Error(`Design Tokens JSON validation failed: ${filePath}: ${error}`);
     }
   }
-  return best;
+
+  return {
+    bytes: info.size,
+    sha256: await sha256File(filePath)
+  };
 }
 
-async function downloadActive(page, destination, extension) {
-  const candidate = await findDownloadButton(page, extension);
-  if (!candidate) {
-    const fallback = await largestVisibleCodeBlock(page);
-    if (!fallback) throw new Error(`No download button or visible code block for ${extension}`);
-    await writeFile(destination, fallback, 'utf8');
-    return { method: 'visible-code-fallback', button: null };
-  }
+async function downloadActiveExport(page, destination, spec) {
+  const button = await namedButton(page, spec.extension, 20_000);
+  await button.scrollIntoViewIfNeeded();
+
+  const temporary = `${destination}.part`;
+  await rm(temporary, { force: true });
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await button.click({ timeout: 20_000 });
+  const download = await downloadPromise;
+  await download.saveAs(temporary);
+
+  const failure = await download.failure();
+  if (failure) throw new Error(`Browser download failed for ${spec.tab}: ${failure}`);
+
+  await rename(temporary, destination);
+  const validation = await validateFile(destination, spec.kind);
+
+  return {
+    ...validation,
+    suggestedFilename: download.suggestedFilename()
+  };
+}
+
+async function exportStyleOnce(context, entry, attempt) {
+  const destinationFolder = path.join(OUTPUT_DIR, entry.folder);
+  await rm(destinationFolder, { recursive: true, force: true });
+  await mkdir(destinationFolder, { recursive: true });
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(30_000);
+  page.setDefaultNavigationTimeout(60_000);
 
   try {
-    const downloadPromise = page.waitForEvent('download', { timeout: 15_000 });
-    await candidate.button.scrollIntoViewIfNeeded();
-    await candidate.button.click({ timeout: 15_000 });
-    const download = await downloadPromise;
-    await download.saveAs(destination);
+    const response = await page.goto(entry.detailUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000
+    });
+
+    if (response && !response.ok()) {
+      throw new Error(`Detail page returned HTTP ${response.status()}: ${entry.detailUrl}`);
+    }
+
+    await namedButton(page, 'DESIGN.md', 45_000);
+    await page.waitForTimeout(250);
+
+    const files = {};
+    for (const spec of EXPORTS) {
+      await clickNamedButton(page, spec.tab);
+      await page.waitForTimeout(175);
+      await clickNamedButton(page, 'Extended');
+      await page.waitForTimeout(175);
+
+      const destination = path.join(destinationFolder, spec.file);
+      files[spec.file] = await downloadActiveExport(page, destination, spec);
+    }
+
     return {
-      method: 'download',
-      button: { text: candidate.text, aria: candidate.aria, title: candidate.title },
-      suggestedFilename: download.suggestedFilename()
+      id: entry.id,
+      siteName: entry.siteName,
+      sourceUrl: entry.sourceUrl,
+      detailUrl: entry.detailUrl,
+      folder: entry.folder,
+      attempts: attempt,
+      files
     };
-  } catch (error) {
-    const fallback = await largestVisibleCodeBlock(page);
-    if (!fallback) throw error;
-    await writeFile(destination, fallback, 'utf8');
-    return {
-      method: 'visible-code-fallback-after-click',
-      button: { text: candidate.text, aria: candidate.aria, title: candidate.title },
-      downloadError: String(error)
-    };
+  } finally {
+    await page.close().catch(() => {});
   }
+}
+
+async function exportStyle(context, entry) {
+  const attemptErrors = [];
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await exportStyleOnce(context, entry, attempt);
+    } catch (error) {
+      const message = error?.stack || String(error);
+      attemptErrors.push({ attempt, message });
+      console.warn(`[${entry.id}] attempt ${attempt}/${MAX_ATTEMPTS} failed: ${message.split('\n')[0]}`);
+
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(Math.min(15_000, 1_000 * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
+  await rm(path.join(OUTPUT_DIR, entry.folder), { recursive: true, force: true });
+  const error = new Error(`All ${MAX_ATTEMPTS} attempts failed for ${entry.siteName} (${entry.id})`);
+  error.attemptErrors = attemptErrors;
+  throw error;
+}
+
+async function runPass(context, entries, completedById, failureById, label) {
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const progress = `${index + 1}/${entries.length}`;
+    console.log(`[shard ${SHARD_INDEX}/${SHARD_TOTAL}] ${label} ${progress}: ${entry.siteName} — ${entry.id}`);
+
+    try {
+      const result = await exportStyle(context, entry);
+      completedById.set(entry.id, result);
+      failureById.delete(entry.id);
+      console.log(`  completed: ${entry.folder}`);
+    } catch (error) {
+      failureById.set(entry.id, {
+        id: entry.id,
+        siteName: entry.siteName,
+        sourceUrl: entry.sourceUrl,
+        detailUrl: entry.detailUrl,
+        folder: entry.folder,
+        message: error?.message || String(error),
+        attemptErrors: error?.attemptErrors || []
+      });
+      console.error(`  failed: ${error?.message || error}`);
+    }
+
+    if (BETWEEN_STYLES_MS > 0) await sleep(BETWEEN_STYLES_MS);
+  }
+}
+
+async function writePartFiles(catalog, assigned, completedById, failureById) {
+  const completed = [...completedById.values()].sort((a, b) => a.id.localeCompare(b.id));
+  const errors = [...failureById.values()].sort((a, b) => a.id.localeCompare(b.id));
+  const generatedAt = new Date().toISOString();
+
+  await writeFile(
+    path.join(OUTPUT_DIR, `_manifest-part-${partLabel}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      generatedAt,
+      catalogGeneratedAt: catalog.generatedAt,
+      shardIndex: SHARD_INDEX,
+      shardTotal: SHARD_TOTAL,
+      assignedStyles: assigned.length,
+      completedStyles: completed.length,
+      failedStyles: errors.length,
+      entries: completed
+    }, null, 2),
+    'utf8'
+  );
+
+  await writeFile(
+    path.join(OUTPUT_DIR, `_errors-part-${partLabel}.json`),
+    JSON.stringify({
+      generatedAt,
+      shardIndex: SHARD_INDEX,
+      shardTotal: SHARD_TOTAL,
+      errors
+    }, null, 2),
+    'utf8'
+  );
+
+  await writeFile(
+    path.join(OUTPUT_DIR, `_stats-part-${partLabel}.json`),
+    JSON.stringify({
+      generatedAt,
+      shardIndex: SHARD_INDEX,
+      shardTotal: SHARD_TOTAL,
+      assignedStyles: assigned.length,
+      completedStyles: completed.length,
+      failedStyles: errors.length
+    }, null, 2),
+    'utf8'
+  );
 }
 
 async function main() {
-  await mkdir(OUT, { recursive: true });
-  const catalog = (await getCatalog()).slice(0, LIMIT);
-  console.log(`Testing ${catalog.length} style(s)`);
+  assertShardSettings();
+  await mkdir(OUTPUT_DIR, { recursive: true });
 
-  const browser = await chromium.launch({ headless: true });
+  const catalog = JSON.parse(await readFile(CATALOG_FILE, 'utf8'));
+  if (!Array.isArray(catalog.entries) || catalog.entries.length === 0) {
+    throw new Error(`Invalid or empty catalog: ${CATALOG_FILE}`);
+  }
+
+  const assigned = catalog.entries.filter((_, index) => index % SHARD_TOTAL === SHARD_INDEX);
+  console.log(`Catalog contains ${catalog.entries.length} styles; shard ${SHARD_INDEX} received ${assigned.length}.`);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-dev-shm-usage']
+  });
   const context = await browser.newContext({
     acceptDownloads: true,
     viewport: { width: 1920, height: 1080 },
-    locale: 'en-US'
+    locale: 'en-US',
+    serviceWorkers: 'block'
   });
-  const page = await context.newPage();
-  await page.route('**/*', async (route) => {
+
+  await context.route('**/*', async (route) => {
     const type = route.request().resourceType();
-    if (['image', 'media', 'font'].includes(type)) await route.abort();
-    else await route.continue();
+    if (type === 'image' || type === 'media' || type === 'font') {
+      await route.abort();
+    } else {
+      await route.continue();
+    }
   });
 
-  const diagnostics = [];
-  for (const style of catalog) {
-    const folder = path.join(OUT, folderNameFor(style));
-    await mkdir(folder, { recursive: true });
-    const detailUrl = `${BASE}/style/${style.id}`;
-    console.log(`Opening ${detailUrl}`);
-    await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.getByText(style.siteName, { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(1_000);
+  const completedById = new Map();
+  const failureById = new Map();
 
-    const entry = {
-      id: style.id,
-      siteName: style.siteName,
-      sourceUrl: style.url,
-      detailUrl,
-      initialButtons: await visibleButtonDiagnostics(page),
-      files: {}
-    };
+  try {
+    await runPass(context, assigned, completedById, failureById, 'primary');
 
-    const exports = [
-      { tab: 'DESIGN.md', extension: '.md', file: 'design.md' },
-      { tab: 'Tailwind v4', extension: '.css', file: 'tailwind-v4.css' },
-      { tab: 'CSS Variables', extension: '.css', file: 'css-variables.css' },
-      { tab: 'Design Tokens', extension: '.json', file: 'design-tokens.json' }
-    ];
-
-    for (const spec of exports) {
-      console.log(`  ${spec.tab}`);
-      await clickNamedButton(page, spec.tab);
-      await page.waitForTimeout(250);
-      await clickNamedButton(page, 'Extended');
-      await page.waitForTimeout(250);
-      const destination = path.join(folder, spec.file);
-      const result = await downloadActive(page, destination, spec.extension);
-      const info = await stat(destination);
-      if (info.size === 0) throw new Error(`Empty output: ${destination}`);
-      entry.files[spec.file] = { ...result, bytes: info.size };
+    if (failureById.size > 0) {
+      const recoveryEntries = assigned.filter((entry) => failureById.has(entry.id));
+      console.warn(`Recovery pass for ${recoveryEntries.length} failed style(s) starts in 20 seconds.`);
+      await sleep(20_000);
+      await runPass(context, recoveryEntries, completedById, failureById, 'recovery');
     }
-
-    diagnostics.push(entry);
+  } finally {
+    await writePartFiles(catalog, assigned, completedById, failureById);
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 
-  await writeFile(path.join(OUT, '_diagnostics.json'), JSON.stringify(diagnostics, null, 2), 'utf8');
-  await browser.close();
-  console.log('Done');
+  if (failureById.size > 0) {
+    throw new Error(`Shard ${SHARD_INDEX} finished with ${failureById.size} failed style(s)`);
+  }
+
+  console.log(`Shard ${SHARD_INDEX} complete: ${completedById.size}/${assigned.length}.`);
 }
 
-main().catch(async (error) => {
+main().catch((error) => {
   console.error(error?.stack || error);
   process.exitCode = 1;
 });
