@@ -1,4 +1,4 @@
-name: Refero export probe
+name: Refero full Extended export
 
 on:
   push:
@@ -15,12 +15,52 @@ env:
   CI: true
 
 jobs:
-  probe:
+  catalog:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Collect the complete Refero catalog
+        run: node catalog.mjs
+
+      - name: Upload catalog snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: refero-catalog
+          path: catalog/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  export:
+    needs: catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create shard output directory
+        run: mkdir -p output
+
+      - name: Download catalog snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: refero-catalog
+          path: catalog
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -33,28 +73,85 @@ jobs:
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Export one style
+      - name: Export Extended files for shard ${{ matrix.shard }}
         env:
-          LIMIT: 1
+          CATALOG_FILE: catalog/catalog.json
+          OUTPUT_DIR: output
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 8
+          MAX_ATTEMPTS: 4
+          BETWEEN_STYLES_MS: 125
         run: node exporter.mjs
 
-      - name: Package probe
-        if: always()
-        run: |
-          if [ -d output ]; then
-            zip -qr refero-probe.zip output
-          else
-            mkdir -p output
-            printf 'No output directory was generated.\n' > output/ERROR.txt
-            zip -qr refero-probe.zip output
-          fi
-
-      - name: Upload probe artifact
+      - name: Upload shard ${{ matrix.shard }}
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: refero-probe
-          path: refero-probe.zip
+          name: refero-shard-${{ matrix.shard }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  combine:
+    if: always()
+    needs: [catalog, export]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download catalog snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: refero-catalog
+          path: catalog
+
+      - name: Download and merge all shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: refero-shard-*
+          path: combined
+          merge-multiple: true
+
+      - name: Validate completeness and build package directory
+        env:
+          CATALOG_FILE: catalog/catalog.json
+          COMBINED_DIR: combined
+          PACKAGE_ROOT: package/Refero_Styles
+        run: node combine.mjs
+
+      - name: Create final ZIP
+        run: |
+          cd package
+          zip -q -r -9 ../Refero_Styles_ALL_Extended.zip Refero_Styles
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: refero-styles-all-extended
+          path: Refero_Styles_ALL_Extended.zip
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refero-export-diagnostics
+          path: |
+            catalog/_catalog-summary.json
+            combined/_combine-problems.json
+            combined/_errors-part-*.json
+            combined/_stats-part-*.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
