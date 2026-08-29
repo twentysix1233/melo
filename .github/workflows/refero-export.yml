@@ -1,0 +1,60 @@
+name: Refero export probe
+
+on:
+  push:
+    branches:
+      - refero-export-temp
+    paths:
+      - .github/workflows/refero-export.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Export one style
+        env:
+          LIMIT: 1
+        run: node exporter.mjs
+
+      - name: Package probe
+        if: always()
+        run: |
+          if [ -d output ]; then
+            zip -qr refero-probe.zip output
+          else
+            mkdir -p output
+            printf 'No output directory was generated.\n' > output/ERROR.txt
+            zip -qr refero-probe.zip output
+          fi
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refero-probe
+          path: refero-probe.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
