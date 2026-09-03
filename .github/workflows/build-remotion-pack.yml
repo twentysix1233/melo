@@ -1,0 +1,65 @@
+name: Build Remotion Production Master Pack
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore and verify pack builder
+        shell: bash
+        run: |
+          cat .github/workflow-payload/build_pack.py.gz.b64.part* > /tmp/build_pack.py.gz.b64
+          echo "53ef7294565d51a293595009177e3ff4ecb314dab4a06b49a7c429843e059c7d  /tmp/build_pack.py.gz.b64" | sha256sum --check
+          base64 --decode /tmp/build_pack.py.gz.b64 | gzip --decompress > build_pack.py
+          echo "b4d06ad9ad22a44caa1072ba94d57cc7d5163e3f757323eb01c2d7d9eeaf192c  build_pack.py" | sha256sum --check
+          python3 -m py_compile build_pack.py
+
+      - name: Clone Remocn source
+        shell: bash
+        run: |
+          mkdir -p sources
+          git clone --depth 1 https://github.com/Remocn/remocn.git sources/remocn
+
+      - name: Clone official Remotion skills
+        shell: bash
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/remotion-dev/remotion.git sources/remotion
+          git -C sources/remotion sparse-checkout set packages/skills
+          curl -fsSL https://raw.githubusercontent.com/remotion-dev/remotion/main/LICENSE.md -o sources/remotion/LICENSE.md
+
+      - name: Build complete archive tree
+        shell: bash
+        run: python3 build_pack.py
+
+      - name: Verify component completeness
+        shell: bash
+        run: python3 dist/remotion-production-master-pack/scripts/verify-pack.py
+
+      - name: Create ZIP and checksum
+        shell: bash
+        run: |
+          cd dist
+          zip -qr ../remotion-production-master-pack.zip remotion-production-master-pack
+          cd ..
+          sha256sum remotion-production-master-pack.zip > remotion-production-master-pack.zip.sha256
+          unzip -t remotion-production-master-pack.zip
+          ls -lh remotion-production-master-pack.zip remotion-production-master-pack.zip.sha256
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotion-production-master-pack
+          path: |
+            remotion-production-master-pack.zip
+            remotion-production-master-pack.zip.sha256
+          compression-level: 0
+          retention-days: 1
