@@ -1,0 +1,49 @@
+name: Export Remotion production sources
+
+on:
+  push:
+    branches:
+      - export/remotion-production-pack-20260903
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Clone current upstream sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sources
+          mkdir -p sources
+          git clone --depth 1 https://github.com/Remocn/remocn.git sources/remocn
+          git clone --depth 1 https://github.com/remotion-dev/skills.git sources/remotion-official-skills
+          git clone --depth 1 https://github.com/EveryInc/product-launch-video.git sources/product-launch-video
+          git clone --depth 1 https://github.com/Vincentwei1021/video-shotcraft.git sources/video-shotcraft
+          git clone --depth 1 https://github.com/iart-ai/motion-skills.git sources/motion-skills
+          git clone --depth 1 https://github.com/haidrrrry/claude-remotion-skill.git sources/claude-remotion-skill
+
+      - name: Strip Git history and oversized showcase media
+        shell: bash
+        run: |
+          set -euo pipefail
+          find sources -type d -name .git -prune -exec rm -rf {} +
+          find sources -type f -size +12M -print -delete
+          du -sh sources
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotion-source-snapshot
+          path: sources
+          include-hidden-files: true
+          compression-level: 9
+          retention-days: 1
+          if-no-files-found: error
